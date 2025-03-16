@@ -1,6 +1,13 @@
 // Fullstack_Part8/index.js
 const { ApolloServer } = require("@apollo/server");
-const { startStandaloneServer } = require("@apollo/server/standalone");
+const { expressMiddleware } = require('@apollo/server/express4');
+const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer');
+const { makeExecutableSchema } = require('@graphql-tools/schema');
+const express = require('express');
+const cors = require('cors');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const { useServer } = require('graphql-ws/lib/use/ws');
 const { GraphQLError } = require('graphql');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
@@ -69,6 +76,10 @@ const typeDefs = `
       password: String!
     ): Token
   }
+
+  type Subscription {
+    bookAdded: Book!
+  }
 `;
 
 const resolvers = {
@@ -98,19 +109,44 @@ const resolvers = {
       return Book.find(filter).populate('author');
     },
     allAuthors: async () => {
-      return Author.find({});
+      // Solution for exercise 8.26: Fetch authors with aggregation to avoid N+1 problem
+      const authors = await Author.aggregate([
+        {
+          $lookup: {
+            from: 'books',
+            localField: '_id',
+            foreignField: 'author',
+            as: 'books'
+          }
+        },
+        {
+          $project: {
+            name: 1,
+            born: 1,
+            bookCount: { $size: '$books' }
+          }
+        }
+      ]);
+      
+      return authors;
     },
     me: (root, args, context) => {
       return context.currentUser;
     }
   },
   Author: {
+    // We only use this resolver for authors that don't have bookCount from aggregation
     bookCount: async (root) => {
+      // If bookCount is already calculated (from aggregation), use that
+      if (root.bookCount !== undefined) {
+        return root.bookCount;
+      }
+      // Otherwise count manually (fallback case)
       return Book.countDocuments({ author: root._id });
     }
   },
   Mutation: {
-    addBook: async (root, args, { currentUser }) => {
+    addBook: async (root, args, { currentUser, pubsub }) => {
       if (!currentUser) {
         throw new GraphQLError('Not authenticated', {
           extensions: {
@@ -157,8 +193,13 @@ const resolvers = {
         });
       }
       
-      // Return with populated author
-      return Book.findById(book._id).populate('author');
+      // Populate the author field for the response
+      const populatedBook = await Book.findById(book._id).populate('author');
+      
+      // Publish the new book to subscribers
+      pubsub.publish('BOOK_ADDED', { bookAdded: populatedBook });
+      
+      return populatedBook;
     },
     editAuthor: async (root, args, { currentUser }) => {
       if (!currentUser) {
@@ -229,26 +270,85 @@ const resolvers = {
       return { value: jwt.sign(userForToken, JWT_SECRET) };
     }
   },
+  Subscription: {
+    bookAdded: {
+      subscribe: (_, __, { pubsub }) => pubsub.asyncIterator('BOOK_ADDED')
+    }
+  }
 };
 
-const server = new ApolloServer({
-  typeDefs,
-  resolvers,
-});
+// Set up the server with subscriptions support
+const start = async () => {
+  const app = express();
+  const httpServer = http.createServer(app);
 
-startStandaloneServer(server, {
-  listen: { port: 4000 },
-  context: async ({ req }) => {
-    const auth = req ? req.headers.authorization : null;
-    if (auth && auth.toLowerCase().startsWith('bearer ')) {
-      const decodedToken = jwt.verify(
-        auth.substring(7), JWT_SECRET
-      );
-      const currentUser = await User.findById(decodedToken.id);
-      return { currentUser };
-    }
-    return {};
-  },
-}).then(({ url }) => {
-  console.log(`Server ready at ${url}`);
-});
+  // WebSocket server setup for subscriptions
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    path: '/graphql',
+  });
+
+  const schema = makeExecutableSchema({ typeDefs, resolvers });
+  
+  // Create context for the WebSocket server
+  const serverCleanup = useServer(
+    { 
+      schema,
+      context: async (ctx, msg, args) => {
+        // Context for subscription is simpler, we just need pubsub
+        return { pubsub };
+      }
+    }, 
+    wsServer
+  );
+
+  // Initialize Apollo Server
+  const server = new ApolloServer({
+    schema,
+    plugins: [
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await serverCleanup.dispose();
+            },
+          };
+        },
+      },
+    ],
+  });
+
+  await server.start();
+
+  // Create pubsub instance
+  const { PubSub } = require('graphql-subscriptions');
+  const pubsub = new PubSub();
+
+  app.use(
+    '/graphql',
+    cors(),
+    express.json(),
+    expressMiddleware(server, {
+      context: async ({ req }) => {
+        const auth = req ? req.headers.authorization : null;
+        if (auth && auth.toLowerCase().startsWith('bearer ')) {
+          const decodedToken = jwt.verify(
+            auth.substring(7), JWT_SECRET
+          );
+          const currentUser = await User.findById(decodedToken.id);
+          return { currentUser, pubsub };
+        }
+        return { pubsub };
+      },
+    }),
+  );
+
+  const PORT = 4000;
+  httpServer.listen(PORT, () => {
+    console.log(`Server ready at http://localhost:${PORT}/graphql`);
+    console.log(`Subscription endpoint ready at ws://localhost:${PORT}/graphql`);
+  });
+};
+
+start();
