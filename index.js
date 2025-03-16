@@ -10,7 +10,6 @@ const cors = require("cors");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const { useServer } = require("graphql-ws/lib/use/ws");
-const { PubSub } = require("graphql-subscriptions");
 const { GraphQLError } = require("graphql");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -18,15 +17,83 @@ const Book = require("./models/book");
 const Author = require("./models/author");
 const User = require("./models/user");
 require("dotenv").config();
-// Create pubsub instance
-const pubsub = new PubSub();
+
+// Create a simple custom event emitter for pubsub
+const EventEmitter = require('events');
+class CustomPubSub {
+  constructor() {
+    this.eventEmitter = new EventEmitter();
+  }
+
+  publish(event, payload) {
+    console.log(`Publishing event: ${event}`, payload);
+    this.eventEmitter.emit(event, payload);
+    return true;
+  }
+
+  asyncIterator(events) {
+    console.log(`Setting up async iterator for events:`, events);
+    const eventEmitter = this.eventEmitter;
+    return {
+      [Symbol.asyncIterator]() {
+        const eventNames = Array.isArray(events) ? events : [events];
+        const pullQueue = [];
+        const pushQueue = [];
+        const listeners = eventNames.map(eventName => {
+          return (payload) => {
+            console.log(`Event received: ${eventName}`, payload);
+            pushValue(payload);
+          };
+        });
+
+        eventNames.forEach((eventName, i) => {
+          eventEmitter.on(eventName, listeners[i]);
+        });
+
+        function pushValue(value) {
+          if (pullQueue.length !== 0) {
+            pullQueue.shift().resolve({ value, done: false });
+          } else {
+            pushQueue.push(value);
+          }
+        }
+
+        return {
+          async next() {
+            if (pushQueue.length !== 0) {
+              return { value: pushQueue.shift(), done: false };
+            }
+            return new Promise(resolve => {
+              pullQueue.push({ resolve });
+            });
+          },
+          async return() {
+            eventNames.forEach((eventName, i) => {
+              eventEmitter.removeListener(eventName, listeners[i]);
+            });
+            return { value: undefined, done: true };
+          },
+          async throw(error) {
+            return { value: undefined, done: true };
+          },
+        };
+      },
+    };
+  }
+}
+
+// Use the custom pubsub instead of graphql-subscriptions
+const pubsub = new CustomPubSub();
+
 const MONGODB_URI = process.env.MONGODB_URI;
 console.log("connecting to", MONGODB_URI);
 const JWT_SECRET = process.env.JWT_SECRET || "NEED_A_SECRET_KEY";
+
 mongoose
   .connect(MONGODB_URI)
   .then(() => console.log("connected to MongoDB"))
   .catch((error) => console.log("error connecting to MongoDB:", error.message));
+
 const typeDefs = `
   type Book {
     title: String!
@@ -77,6 +144,7 @@ const typeDefs = `
     bookAdded: Book!
   }
 `;
+
 const resolvers = {
   Query: {
     bookCount: async () => Book.collection.countDocuments(),
@@ -185,8 +253,13 @@ const resolvers = {
       }
       // Populate the author field for the response
       const populatedBook = await Book.findById(book._id).populate("author");
+      
+      console.log("Book saved successfully:", populatedBook);
+      console.log("Publishing to BOOK_ADDED");
+      
       // Publish the new book to subscribers
       pubsub.publish("BOOK_ADDED", { bookAdded: populatedBook });
+      
       return populatedBook;
     },
     editAuthor: async (root, args, { currentUser }) => {
@@ -251,17 +324,23 @@ const resolvers = {
   },
   Subscription: {
     bookAdded: {
-      subscribe: () => pubsub.asyncIterator(["BOOK_ADDED"]),
+      subscribe: () => {
+        console.log("Someone subscribed to bookAdded");
+        return pubsub.asyncIterator(["BOOK_ADDED"]);
+      },
     },
   },
 };
+
 // Set up the server with subscriptions support
 const start = async () => {
   const app = express();
   const httpServer = http.createServer(app);
+  
+  // Create executable schema
   const schema = makeExecutableSchema({ typeDefs, resolvers });
 
-  // Setup logging middleware first
+  // Setup logging middleware
   app.use((req, res, next) => {
     console.log(`Incoming request: ${req.method} ${req.path}`);
     next();
@@ -279,12 +358,20 @@ const start = async () => {
   const serverCleanup = useServer(
     {
       schema,
-      // Important: Add context for the WebSocket connection
       context: async (ctx) => {
-        // You can add authentication here if needed
-        return { pubsub };
+        // Add authentication for WebSocket connections
+        const authHeader = ctx.connectionParams?.authorization || '';
+        if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+          try {
+            const decodedToken = jwt.verify(authHeader.substring(7), JWT_SECRET);
+            const currentUser = await User.findById(decodedToken.id);
+            return { currentUser };
+          } catch (error) {
+            console.error("Token verification failed in WebSocket:", error.message);
+          }
+        }
+        return {};
       },
-      // Add error handlers
       onConnect: async (ctx) => {
         console.log("Client connected to WebSocket");
         return true;
@@ -319,7 +406,7 @@ const start = async () => {
   
   await server.start();
   
-  // Set up the GraphQL endpoint first
+  // Set up the GraphQL endpoint
   app.use(
     "/graphql",
     express.json(),
@@ -330,50 +417,26 @@ const start = async () => {
           try {
             const decodedToken = jwt.verify(auth.substring(7), JWT_SECRET);
             const currentUser = await User.findById(decodedToken.id);
-            return { currentUser, pubsub };
+            return { currentUser };
           } catch (error) {
             console.error("Token verification failed:", error.message);
-            return { pubsub };
           }
         }
-        return { pubsub };
+        return {};
       },
     })
   );
   
-  // Simple response for the root path - NO REDIRECT
+  // Simple response for the root path
   app.get("/", (req, res) => {
     res.send('GraphQL API is running at <a href="/graphql">/graphql</a>');
-  });
-
-  // Handle POST to root differently to avoid redirect loops
-  app.post("/", express.json(), (req, res) => {
-    console.log("POST request to root - should go to /graphql instead");
-    
-    // Forward the request to the GraphQL handler
-    expressMiddleware(server, {
-      context: async ({ req }) => {
-        const auth = req ? req.headers.authorization : null;
-        if (auth && auth.toLowerCase().startsWith("bearer ")) {
-          try {
-            const decodedToken = jwt.verify(auth.substring(7), JWT_SECRET);
-            const currentUser = await User.findById(decodedToken.id);
-            return { currentUser, pubsub };
-          } catch (error) {
-            return { pubsub };
-          }
-        }
-        return { pubsub };
-      },
-    })(req, res);
   });
   
   const PORT = 4000;
   httpServer.listen(PORT, () => {
     console.log(`Server ready at http://localhost:${PORT}/graphql`);
-    console.log(
-      `Subscription endpoint ready at ws://localhost:${PORT}/graphql`
-    );
+    console.log(`Subscription endpoint ready at ws://localhost:${PORT}/graphql`);
   });
 };
+
 start();
